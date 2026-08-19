@@ -1,0 +1,17 @@
+[project]
+name = "booktalk-backend"
+version = "0.1.0"
+description = "BookTalk MVP backend — PDF upload, per-page text extraction, Gemini ephemeral tokens"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "pymupdf>=1.24.0",
+    "google-genai>=1.0.0",
+    "python-multipart>=0.0.9",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[tool.uv]
+dev-dependencies = []

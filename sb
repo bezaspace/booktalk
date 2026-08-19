@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# sb — start BookTalk backend (FastAPI on :8000)
+# Run from anywhere; cd's into the backend dir automatically.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/backend"
+
+if [[ ! -d .venv ]]; then
+  echo "First run: syncing backend dependencies with uv..."
+  uv sync
+fi
+
+# Ensure .env exists with a key (warn, don't block — token endpoint will 500 otherwise)
+if [[ ! -f .env ]]; then
+  echo "WARNING: backend/.env not found. Copy backend/.env.example to .env and set GEMINI_API_KEY."
+fi
+
+exec uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
