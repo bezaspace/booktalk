@@ -122,10 +122,27 @@ body,
   min-height: 0;
 }
 .app-main.sidebar-open {
-  grid-template-columns: 280px 1fr 380px;
+  grid-template-columns: 280px 6px 1fr 380px;
 }
 .app-main.sidebar-collapsed {
   grid-template-columns: 48px 1fr 380px;
+}
+
+/* Draggable divider between sidebar and PDF pane */
+.sidebar-resizer {
+  width: 6px;
+  cursor: col-resize;
+  background: var(--border);
+  border-left: 1px solid transparent;
+  border-right: 1px solid transparent;
+  transition: background 0.12s, border-color 0.12s;
+  touch-action: none;
+  user-select: none;
+}
+.sidebar-resizer:hover,
+.sidebar-resizer:active {
+  background: var(--accent);
+  border-color: var(--accent);
 }
 
 .pdf-pane {
@@ -746,8 +763,11 @@ body,
   .app-main,
   .app-main.sidebar-open,
   .app-main.sidebar-collapsed {
-    grid-template-columns: 1fr;
+    grid-template-columns: 1fr !important;
     grid-template-rows: auto 1fr auto;
+  }
+  .sidebar-resizer {
+    display: none;
   }
   .sidebar {
     max-height: 260px;

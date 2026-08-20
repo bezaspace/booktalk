@@ -27,6 +27,10 @@ export default function App() {
   const [outline, setOutline] = useState<OutlineItem[]>([])
   const [hasOutline, setHasOutline] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [sidebarWidth, setSidebarWidth] = useState(280)
+  const isResizingRef = useRef(false)
+  const resizeStartXRef = useRef(0)
+  const resizeStartWidthRef = useRef(280)
 
   // Voice state
   const [status, setStatus] = useState<VoiceStatus>('idle')
@@ -261,12 +265,67 @@ export default function App() {
     )
   }
 
-  // Sidebar width influences the grid — handled via CSS class.
+  // Resizable sidebar divider — drag to adjust width.
+  const SIDEBAR_MIN = 180
+  const SIDEBAR_MAX = 480
+  const SIDEBAR_DEFAULT = 280
+
+  const onResizePointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      if (sidebarCollapsed) return
+      isResizingRef.current = true
+      resizeStartXRef.current = e.clientX
+      resizeStartWidthRef.current = sidebarWidth
+      ;(e.target as HTMLElement).setPointerCapture(e.pointerId)
+      document.body.style.cursor = 'col-resize'
+      document.body.style.userSelect = 'none'
+      e.preventDefault()
+    },
+    [sidebarCollapsed, sidebarWidth],
+  )
+
+  const onResizePointerMove = useCallback((e: PointerEvent) => {
+    if (!isResizingRef.current) return
+    const dx = e.clientX - resizeStartXRef.current
+    const next = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, resizeStartWidthRef.current + dx))
+    setSidebarWidth(next)
+  }, [])
+
+  const onResizePointerUp = useCallback((e: PointerEvent) => {
+    if (!isResizingRef.current) return
+    isResizingRef.current = false
+    document.body.style.cursor = ''
+    document.body.style.userSelect = ''
+    // If released after pointer capture, release explicitly.
+    try {
+      const el = document.querySelector('.sidebar-resizer') as HTMLElement | null
+      if (el && (e.target as HTMLElement)?.hasPointerCapture) {
+        /* no-op, pointer capture auto-released */
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [])
+
+  useEffect(() => {
+    window.addEventListener('pointermove', onResizePointerMove)
+    window.addEventListener('pointerup', onResizePointerUp)
+    return () => {
+      window.removeEventListener('pointermove', onResizePointerMove)
+      window.removeEventListener('pointerup', onResizePointerUp)
+    }
+  }, [onResizePointerMove, onResizePointerUp])
+
+  // Inline grid template so width is dynamic. Resizer gets a fixed 6px column when open.
+  const mainStyle: React.CSSProperties = sidebarCollapsed
+    ? { gridTemplateColumns: `48px 1fr 380px` }
+    : { gridTemplateColumns: `${sidebarWidth}px 6px 1fr 380px` }
+
   const mainClass = `app-main ${sidebarCollapsed ? 'sidebar-collapsed' : 'sidebar-open'}`
 
   return (
     <div className="app-shell">
-      <main className={mainClass}>
+      <main className={mainClass} style={mainStyle}>
         <Sidebar
           outline={outline}
           hasOutline={hasOutline}
@@ -277,6 +336,17 @@ export default function App() {
           collapsed={sidebarCollapsed}
           onToggleCollapsed={() => setSidebarCollapsed((v) => !v)}
         />
+        {!sidebarCollapsed && (
+          <div
+            className="sidebar-resizer"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize outline panel"
+            title="Drag to resize — double-click to reset"
+            onPointerDown={onResizePointerDown}
+            onDoubleClick={() => setSidebarWidth(SIDEBAR_DEFAULT)}
+          />
+        )}
         <section className="pdf-pane">
           {pdfData && (
             <PdfViewer
