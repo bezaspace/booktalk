@@ -1,6 +1,6 @@
 /** Thin client for the BookTalk backend. All calls go through /api (proxied). */
 
-import type { PageResponse, TokenResponse, UploadResponse } from './types'
+import type { OutlineResponse, PageResponse, TokenResponse, UploadResponse } from './types'
 
 const BASE = '/api'
 
@@ -32,4 +32,9 @@ export function fetchPage(sessionId: string, page: number): Promise<PageResponse
 
 export function fetchToken(): Promise<TokenResponse> {
   return jsonFetch<TokenResponse>('/token')
+}
+
+export function fetchOutline(sessionId: string): Promise<OutlineResponse> {
+  const qs = new URLSearchParams({ session: sessionId })
+  return jsonFetch<OutlineResponse>(`/outline?${qs.toString()}`)
 }

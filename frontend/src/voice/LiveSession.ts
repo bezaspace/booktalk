@@ -160,6 +160,7 @@ export class LiveSession {
   async connect(): Promise<void> {
     this.intentionallyClosed = false
     this.callbacks.onStatus('connecting')
+    console.debug('[Live] connect() start', { hasResumptionHandle: !!this.resumptionHandle })
 
     await this.ensureMic()
     await this.ensurePlayback()
@@ -183,13 +184,16 @@ export class LiveSession {
       config,
       callbacks: {
         onopen: () => {
+          console.debug('[Live] WebSocket onopen')
           this.callbacks.onStatus(this.pttHeld ? 'listening' : 'connected')
         },
         onmessage: (msg: LiveServerMessage) => this.handleMessage(msg),
         onerror: (e: ErrorEvent) => {
+          console.error('[Live] WebSocket onerror', e.message)
           this.callbacks.onError(`Live error: ${e.message}`)
         },
         onclose: () => {
+          console.warn('[Live] WebSocket onclose. intentionallyClosed=' + this.intentionallyClosed + ' speaking=' + this.speaking + ' queueLen=' + this.playbackQueue.length)
           if (this.intentionallyClosed) return
           // Unexpected close — try to resume if we have a handle.
           this.callbacks.onStatus('connecting')
@@ -203,10 +207,12 @@ export class LiveSession {
   private scheduleReconnect(): void {
     if (this.intentionallyClosed) return
     if (this.reconnectTimer) return
+    console.warn('[Live] scheduling reconnect in 800ms. hasHandle=' + !!this.resumptionHandle)
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       if (this.intentionallyClosed) return
       this.connect().catch((err) => {
+        console.error('[Live] reconnect failed', err)
         this.callbacks.onError(`Reconnect failed: ${err?.message ?? err}`)
         this.scheduleReconnect()
       })
@@ -262,6 +268,7 @@ export class LiveSession {
   startPushToTalk(): void {
     if (!this.session) return
     this.pttHeld = true
+    console.debug('[Live] PTT start — interrupting playback. speaking=' + this.speaking + ' queueLen=' + this.playbackQueue.length)
     // Interrupt any in-flight playback.
     this.stopPlayback()
     // Finalize any pending assistant transcript from a prior turn.
@@ -279,6 +286,7 @@ export class LiveSession {
   /** End a push-to-talk burst: flush the audio stream. */
   endPushToTalk(): void {
     this.pttHeld = false
+    console.debug('[Live] PTT end — flushing audioStreamEnd')
     if (this.session) {
       // Flush cached audio so the server processes the turn promptly.
       this.session.sendRealtimeInput({ audioStreamEnd: true })
@@ -319,6 +327,7 @@ export class LiveSession {
     // Session resumption update — capture the latest handle.
     if (msg.sessionResumptionUpdate) {
       const upd = msg.sessionResumptionUpdate
+      console.debug('[Live] sessionResumptionUpdate', { resumable: upd.resumable, hasHandle: !!upd.newHandle })
       if (upd.resumable && upd.newHandle) {
         this.resumptionHandle = upd.newHandle
       }
@@ -326,11 +335,15 @@ export class LiveSession {
 
     // GoAway — server will disconnect soon; reconnect proactively.
     if (msg.goAway) {
+      console.warn('[Live] GoAway received — scheduling reconnect. speaking=' + this.speaking + ' queueLen=' + this.playbackQueue.length)
       this.scheduleReconnect()
       return
     }
 
-    if (!content) return
+    if (!content) {
+      console.debug('[Live] message with no serverContent', Object.keys(msg))
+      return
+    }
 
     // Transcripts — fragments arrive incrementally; accumulate and emit full text.
     if (content.inputTranscription?.text) {
@@ -367,6 +380,7 @@ export class LiveSession {
     // Interruption — stop playback immediately and finalize the partial
     // assistant transcript so the next response starts a fresh entry.
     if (content.interrupted) {
+      console.warn('[Live] INTERRUPTED — stopping playback. pttHeld=' + this.pttHeld + ' queueLen=' + this.playbackQueue.length + ' speaking=' + this.speaking)
       this.stopPlayback()
       if (this.currentAssistantEntryId) {
         this.callbacks.onTranscriptUpdate(this.currentAssistantEntryId, this.currentAssistantText, false)
@@ -379,15 +393,22 @@ export class LiveSession {
 
     // Audio parts — enqueue for playback.
     if (content.modelTurn?.parts) {
-      for (const part of content.modelTurn.parts) {
+      const parts = content.modelTurn.parts
+      let audioCount = 0
+      for (const part of parts) {
         if (part.inlineData?.data) {
           this.enqueueAudio(part.inlineData.data)
+          audioCount++
         }
+      }
+      if (audioCount > 0) {
+        console.debug('[Live] audio chunks received', { count: audioCount, queueLen: this.playbackQueue.length, speaking: this.speaking })
       }
     }
 
     // Turn complete — finalize transcript entries (mark non-partial).
     if (content.turnComplete) {
+      console.debug('[Live] turnComplete. speaking=' + this.speaking + ' queueLen=' + this.playbackQueue.length + ' pttHeld=' + this.pttHeld)
       if (this.currentUserEntryId) {
         this.callbacks.onTranscriptUpdate(this.currentUserEntryId, this.currentUserText, false)
         this.currentUserEntryId = null
@@ -431,6 +452,7 @@ export class LiveSession {
     if (!this.speaking) {
       this.speaking = true
       if (!this.pttHeld) this.callbacks.onStatus('speaking')
+      console.debug('[Live] playback START', { samples: float.length, dur: buffer.duration.toFixed(3), ctxTime: now.toFixed(3) })
     }
 
     source.onended = () => {
@@ -438,12 +460,16 @@ export class LiveSession {
       if (this.playbackQueue.length === 0) {
         this.nextPlayTime = 0
         this.speaking = false
+        console.debug('[Live] playback ENDED (queue drained)')
         if (!this.pttHeld) this.callbacks.onStatus('connected')
       }
     }
   }
 
   private stopPlayback(): void {
+    if (this.playbackQueue.length > 0) {
+      console.debug('[Live] stopPlayback — clearing ' + this.playbackQueue.length + ' queued sources')
+    }
     for (const q of this.playbackQueue) {
       try {
         q.source.onended = null

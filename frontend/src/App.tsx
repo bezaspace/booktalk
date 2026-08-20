@@ -3,11 +3,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 
-import { fetchPage, fetchToken, uploadPdf } from './api'
+import { fetchOutline, fetchPage, fetchToken, uploadPdf } from './api'
 import { PdfViewer, canvasToJpegBytes } from './pdf/PdfViewer'
+import { Sidebar } from './pdf/Sidebar'
 import { VoicePanel } from './voice/VoicePanel'
 import { LiveSession } from './voice/LiveSession'
-import type { TranscriptEntry, VoiceStatus } from './types'
+import type { OutlineItem, TranscriptEntry, VoiceStatus } from './types'
 
 type Phase = 'upload' | 'reading'
 
@@ -21,6 +22,11 @@ export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [pageCount, setPageCount] = useState(0)
   const [currentPage, setCurrentPage] = useState(1)
+
+  // Outline / thumbnails sidebar
+  const [outline, setOutline] = useState<OutlineItem[]>([])
+  const [hasOutline, setHasOutline] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
 
   // Voice state
   const [status, setStatus] = useState<VoiceStatus>('idle')
@@ -45,6 +51,19 @@ export default function App() {
       setPageCount(resp.page_count)
       setCurrentPage(1)
       lastInjectedPageRef.current = -1
+      // Fetch outline for the sidebar — non-fatal if it fails.
+      setOutline([])
+      setHasOutline(false)
+      setSidebarCollapsed(false)
+      fetchOutline(resp.session_id)
+        .then((o) => {
+          setOutline(o.items)
+          setHasOutline(o.has_outline)
+          if (!o.has_outline) setSidebarCollapsed(false)
+        })
+        .catch(() => {
+          /* leave empty */
+        })
       setPhase('reading')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -127,6 +146,45 @@ export default function App() {
     lastInjectedPageRef.current = -1
   }, [])
 
+  // Refresh the Gemini Live session: tear down the current connection,
+  // clear the transcript, and start a brand-new session with fresh context
+  // (new ephemeral token, no resumption handle). The PDF stays put.
+  const refreshSession = useCallback(async () => {
+    liveRef.current?.close()
+    liveRef.current = null
+    setSessionActive(false)
+    setStatus('idle')
+    setTranscript([])
+    lastInjectedPageRef.current = -1
+    setError(null)
+    // Start a fresh session and re-inject the current page context.
+    try {
+      const { token, model } = await fetchToken()
+      const session = new LiveSession(token, model, {
+        onStatus: setStatus,
+        onTranscript: (entry) =>
+          setTranscript((prev) => [...prev, entry]),
+        onTranscriptUpdate: (id, text, partial) =>
+          setTranscript((prev) =>
+            prev.map((e) => (e.id === id ? { ...e, text, partial } : e)),
+          ),
+        onError: (msg) => {
+          setError(msg)
+          setStatus('error')
+        },
+      })
+      await session.connect()
+      liveRef.current = session
+      setSessionActive(true)
+      lastInjectedPageRef.current = -1
+      void injectCurrentPage(currentPage)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      setStatus('error')
+      setSessionActive(false)
+    }
+  }, [currentPage, injectCurrentPage])
+
   // When the page changes, render happens in PdfViewer; once the canvas is
   // ready it calls onCanvasReady, which triggers injection (so the JPEG for
   // scanned pages reflects the freshly-rendered page).
@@ -203,16 +261,22 @@ export default function App() {
     )
   }
 
+  // Sidebar width influences the grid — handled via CSS class.
+  const mainClass = `app-main ${sidebarCollapsed ? 'sidebar-collapsed' : 'sidebar-open'}`
+
   return (
     <div className="app-shell">
-      <header className="app-header">
-        <div className="brand">BookTalk</div>
-        <div className="header-status">
-          <span className={`status-dot ${status}`} aria-hidden />
-          <span>{status}</span>
-        </div>
-      </header>
-      <main className="app-main">
+      <main className={mainClass}>
+        <Sidebar
+          outline={outline}
+          hasOutline={hasOutline}
+          pdfData={pdfData}
+          pageCount={pageCount}
+          currentPage={currentPage}
+          onPageChange={handlePageChange}
+          collapsed={sidebarCollapsed}
+          onToggleCollapsed={() => setSidebarCollapsed((v) => !v)}
+        />
         <section className="pdf-pane">
           {pdfData && (
             <PdfViewer
@@ -232,6 +296,7 @@ export default function App() {
             pttDisabled={pttDisabled}
             onStartSession={startSession}
             onStopSession={stopSession}
+            onRefreshSession={refreshSession}
             onPushToTalkStart={onPTTStart}
             onPushToTalkEnd={onPTTEnd}
           />

@@ -38,6 +38,7 @@ export function PdfViewer({
   const pdfDocRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null)
   const loadingTaskRef = useRef<pdfjsLib.PDFDocumentLoadingTask | null>(null)
   const [scale, setScale] = useState(1.2)
+  const [inverted, setInverted] = useState(false)
   const [jumpInput, setJumpInput] = useState(String(currentPage))
   // Flips true once the PDFDocumentProxy is available. The render effect
   // depends on this so it re-runs after the doc loads even when currentPage
@@ -88,9 +89,22 @@ export function PdfViewer({
       .then((page) => {
         if (!active) return
         const viewport = page.getViewport({ scale })
-        canvas.width = viewport.width
-        canvas.height = viewport.height
-        const task = page.render({ canvas, canvasContext: ctx, viewport })
+        // Render at native device resolution to avoid blur on HiDPI/fractional-
+        // scaling displays. Ceiling the ratio fixes blur on non-Firefox
+        // browsers with fractional ratios (e.g. 1.1, 1.15) — see pdf.js PR
+        // #19374. CSS size stays at viewport dims; the bitmap is scaled up by
+        // the browser at crisp device-pixel resolution.
+        const outputScale = Math.ceil(window.devicePixelRatio || 1)
+        canvas.width = Math.floor(viewport.width * outputScale)
+        canvas.height = Math.floor(viewport.height * outputScale)
+        canvas.style.width = `${viewport.width}px`
+        canvas.style.height = `${viewport.height}px`
+        const task = page.render({
+          canvas,
+          canvasContext: ctx,
+          viewport,
+          transform: outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : undefined,
+        })
         renderTaskRef.current = task
         return task.promise
       })
@@ -128,6 +142,78 @@ export function PdfViewer({
     }
   }, [jumpInput, pageCount, currentPage, onPageChange])
 
+  // -----------------------------------------------------------------
+  // Keyboard: Left/Right arrows flip pages (ignored while typing).
+  // -----------------------------------------------------------------
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
+      const t = e.target as HTMLElement | null
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+      e.preventDefault()
+      if (e.key === 'ArrowLeft') goPrev()
+      else goNext()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [goPrev, goNext])
+
+  // -----------------------------------------------------------------
+  // Page scrubber: a vertical track whose thumb represents the current
+  // page position. Click or drag anywhere on the track to jump.
+  // -----------------------------------------------------------------
+  const trackRef = useRef<HTMLDivElement | null>(null)
+  const draggingRef = useRef(false)
+
+  const pageFromY = useCallback(
+    (clientY: number) => {
+      const track = trackRef.current
+      if (!track) return null
+      const rect = track.getBoundingClientRect()
+      if (rect.height === 0) return null
+      const ratio = Math.min(1, Math.max(0, (clientY - rect.top) / rect.height))
+      // Align the thumb center with the cursor: map ratio across the
+      // (pageCount - 1) interval, then +1 to get a 1-based page number.
+      const n = Math.round(ratio * (pageCount - 1)) + 1
+      return Math.min(pageCount, Math.max(1, n))
+    },
+    [pageCount],
+  )
+
+  const onTrackPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const n = pageFromY(e.clientY)
+      if (!n) return
+      onPageChange(n)
+      draggingRef.current = true
+      e.currentTarget.setPointerCapture(e.pointerId)
+    },
+    [pageFromY, onPageChange],
+  )
+
+  const onTrackPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!draggingRef.current) return
+      const n = pageFromY(e.clientY)
+      if (n) onPageChange(n)
+    },
+    [pageFromY, onPageChange],
+  )
+
+  const onTrackPointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    draggingRef.current = false
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    } catch {
+      /* no-op */
+    }
+  }, [])
+
+  // Thumb covers a single page's worth of the track (min 18px so it stays grabbable).
+  const thumbRatio = pageCount > 0 ? 1 / pageCount : 1
+  const thumbTopPct = pageCount > 1 ? ((currentPage - 1) / (pageCount - 1)) * (1 - thumbRatio) * 100 : 0
+  const thumbHeightPct = thumbRatio * 100
+
   return (
     <div className="pdf-viewer">
       <div className="pdf-toolbar">
@@ -158,9 +244,41 @@ export function PdfViewer({
         <button className="zoom" onClick={() => setScale((s) => Math.min(3, s + 0.2))} aria-label="Zoom in">
           +
         </button>
+        <button
+          className={`invert-toggle ${inverted ? 'active' : ''}`}
+          onClick={() => setInverted((v) => !v)}
+          aria-pressed={inverted}
+          aria-label="Invert colors"
+          title="Invert colors (dark mode)"
+        >
+          {inverted ? '◐' : '◑'}
+        </button>
       </div>
       <div className="pdf-canvas-wrap">
-        <canvas ref={canvasRef} />
+        <canvas ref={canvasRef} className={inverted ? 'inverted' : ''} />
+        {pageCount > 1 && (
+          <div
+            className="pdf-scrubber"
+            ref={trackRef}
+            role="slider"
+            aria-label="Page scrubber"
+            aria-valuemin={1}
+            aria-valuemax={pageCount}
+            aria-valuenow={currentPage}
+            onPointerDown={onTrackPointerDown}
+            onPointerMove={onTrackPointerMove}
+            onPointerUp={onTrackPointerUp}
+            onPointerCancel={onTrackPointerUp}
+          >
+            <div
+              className="pdf-scrubber-thumb"
+              style={{
+                top: `${thumbTopPct}%`,
+                height: `max(${thumbHeightPct}%, 18px)`,
+              }}
+            />
+          </div>
+        )}
       </div>
     </div>
   )

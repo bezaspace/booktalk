@@ -48,6 +48,17 @@ class TokenResponse(BaseModel):
     expires_at: str  # ISO 8601
 
 
+class OutlineItem(BaseModel):
+    level: int  # 1 = top-level, nested deeper = higher number
+    title: str
+    page: int  # 1-based page number
+
+
+class OutlineResponse(BaseModel):
+    has_outline: bool
+    items: list[OutlineItem]
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -107,6 +118,48 @@ async def get_page(
         text=text,
         is_scanned=is_scanned,
     )
+
+
+@app.get("/outline", response_model=OutlineResponse)
+async def get_outline(
+    session: str = Query(..., description="Session id from /upload"),
+) -> OutlineResponse:
+    """Return the document's table of contents if present.
+
+    Uses PyMuPDF's `doc.get_toc()` which parses the PDF's outline/bookmarks.
+    Each entry is [level, title, page] where page is 1-based. If the PDF has
+    no outline, returns `has_outline: false` and an empty list. The frontend
+    falls back to the thumbnail strip in that case.
+    """
+    sess = store.get(session)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="Unknown session.")
+
+    try:
+        raw_toc = sess.doc.get_toc(simple=True)  # list of [level, title, page, ...]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read outline: {exc}")
+
+    items: list[OutlineItem] = []
+    for entry in raw_toc:
+        if len(entry) < 3:
+            continue
+        level, title, page = entry[0], entry[1], entry[2]
+        # PyMuPDF levels are 1-based; ensure sane bounds.
+        try:
+            level_i = int(level)
+            page_i = int(page)
+            title_s = str(title).strip()
+        except Exception:
+            continue
+        if not title_s:
+            continue
+        # Clamp page to valid range; outline pages are 1-based.
+        page_i = max(1, min(page_i, sess.page_count))
+        level_i = max(1, level_i)
+        items.append(OutlineItem(level=level_i, title=title_s, page=page_i))
+
+    return OutlineResponse(has_outline=len(items) > 0, items=items)
 
 
 @app.get("/token", response_model=TokenResponse)

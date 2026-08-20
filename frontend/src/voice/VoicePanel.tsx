@@ -12,6 +12,7 @@ interface VoicePanelProps {
   pttDisabled: boolean
   onStartSession: () => void
   onStopSession: () => void
+  onRefreshSession: () => void
   onPushToTalkStart: () => void
   onPushToTalkEnd: () => void
 }
@@ -43,6 +44,7 @@ export function VoicePanel({
   pttDisabled,
   onStartSession,
   onStopSession,
+  onRefreshSession,
   onPushToTalkStart,
   onPushToTalkEnd,
 }: VoicePanelProps) {
@@ -80,6 +82,14 @@ export function VoicePanel({
         />
         <span className="status-label">{STATUS_LABEL[status]}</span>
         <span className="header-spacer" />
+        <button
+          className="session-reset"
+          onClick={onRefreshSession}
+          aria-label="Refresh Gemini session"
+          title="Refresh Gemini session (fresh context)"
+        >
+          ↻
+        </button>
         <button
           className={`session-toggle ${sessionActive ? 'stop' : 'start'}`}
           onClick={sessionActive ? onStopSession : onStartSession}

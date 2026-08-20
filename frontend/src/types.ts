@@ -18,6 +18,17 @@ export interface TokenResponse {
   expires_at: string
 }
 
+export interface OutlineItem {
+  level: number
+  title: string
+  page: number
+}
+
+export interface OutlineResponse {
+  has_outline: boolean
+  items: OutlineItem[]
+}
+
 /** Connection state surfaced to the UI. */
 export type VoiceStatus = 'idle' | 'connecting' | 'connected' | 'listening' | 'thinking' | 'speaking' | 'error'
 
