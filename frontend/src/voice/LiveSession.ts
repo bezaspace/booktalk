@@ -128,6 +128,7 @@ export class LiveSession {
   private audioCtx: AudioContext | null = null
   private micStream: MediaStream | null = null
   private captureNode: AudioWorkletNode | null = null
+  private scriptProcessor: ScriptProcessorNode | null = null
   private micOpen = false
   private pttHeld = false
 
@@ -222,12 +223,19 @@ export class LiveSession {
   /** Idempotent: open mic + capture worklet once. */
   private async ensureMic(): Promise<void> {
     if (this.micOpen) return
-    const ctx = new AudioContext({ sampleRate: 48000 })
+    const AudioCtxCtor = (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext) as typeof AudioContext | undefined
+    if (!AudioCtxCtor) {
+      throw new Error('Web Audio API not supported in this browser.')
+    }
+    // Secure-context check — AudioWorklet and getUserMedia require HTTPS or localhost.
+    if (!window.isSecureContext) {
+      console.warn('[Live] isSecureContext=false — mic may fail on http://booktalk.local without flag')
+    }
+    const ctx = new AudioCtxCtor({ sampleRate: 48000 } as AudioContextOptions)
     this.audioCtx = ctx
-    const blob = new Blob([CAPTURE_WORKLET_SOURCE], { type: 'application/javascript' })
-    const url = URL.createObjectURL(blob)
-    await ctx.audioWorklet.addModule(url)
-    URL.revokeObjectURL(url)
+
+    // Prefer AudioWorklet; fall back to ScriptProcessor for insecure contexts / old browsers.
+    const hasWorklet = !!(ctx as unknown as { audioWorklet?: { addModule: (url: string) => Promise<void> } }).audioWorklet?.addModule
 
     this.micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -238,21 +246,68 @@ export class LiveSession {
       },
     })
     const source = ctx.createMediaStreamSource(this.micStream)
-    const node = new AudioWorkletNode(ctx, 'capture-processor', {
-      processorOptions: { targetRate: INPUT_SAMPLE_RATE },
-    })
-    source.connect(node)
-    // Don't connect to destination — we don't want to hear ourselves.
-    node.port.onmessage = (ev: MessageEvent) => {
-      // Only forward while PTT is held.
-      if (this.pttHeld && this.session) {
-        const b64 = int16BufferToBase64(ev.data as ArrayBuffer)
-        this.session.sendRealtimeInput({
+
+    if (hasWorklet) {
+      try {
+        const blob = new Blob([CAPTURE_WORKLET_SOURCE], { type: 'application/javascript' })
+        const url = URL.createObjectURL(blob)
+        await (ctx as unknown as { audioWorklet: { addModule: (u: string) => Promise<void> } }).audioWorklet.addModule(url)
+        URL.revokeObjectURL(url)
+
+        const node = new AudioWorkletNode(ctx, 'capture-processor', {
+          processorOptions: { targetRate: INPUT_SAMPLE_RATE },
+        } as AudioWorkletNodeOptions)
+        source.connect(node)
+        // Don't connect to destination — we don't want to hear ourselves.
+        node.port.onmessage = (ev: MessageEvent) => {
+          // Only forward while PTT is held.
+          if (this.pttHeld && this.session) {
+            const b64 = int16BufferToBase64(ev.data as ArrayBuffer)
+            this.session.sendRealtimeInput({
+              audio: { data: b64, mimeType: 'audio/pcm;rate=16000' },
+            })
+          }
+        }
+        this.captureNode = node as unknown as AudioWorkletNode
+        this.micOpen = true
+        return
+      } catch (e) {
+        console.warn('[Live] AudioWorklet failed, falling back to ScriptProcessor', e)
+        // fall through to ScriptProcessor fallback
+      }
+    }
+
+    // --- ScriptProcessor fallback (deprecated but works everywhere) ---
+    // 4096 buffer, downsample 48k -> 16k via averaging.
+    const processor = (ctx as unknown as { createScriptProcessor: (a: number, b: number, c: number) => ScriptProcessorNode }).createScriptProcessor(4096, 1, 1)
+    const ratio = Math.round((ctx.sampleRate || 48000) / INPUT_SAMPLE_RATE)
+    processor.onaudioprocess = (ev: AudioProcessingEvent) => {
+      if (!this.pttHeld || !this.session) return
+      const input = ev.inputBuffer.getChannelData(0)
+      const outLen = Math.floor(input.length / ratio)
+      const out = new Int16Array(outLen)
+      for (let i = 0, oi = 0; i + ratio <= input.length; i += ratio, oi++) {
+        let sum = 0
+        for (let j = 0; j < ratio; j++) sum += input[i + j]!
+        const avg = sum / ratio
+        const s = Math.max(-1, Math.min(1, avg))
+        out[oi] = s < 0 ? s * 0x8000 : s * 0x7fff
+      }
+      if (out.length > 0) {
+        const b64 = int16BufferToBase64(out.buffer as ArrayBuffer)
+        this.session!.sendRealtimeInput({
           audio: { data: b64, mimeType: 'audio/pcm;rate=16000' },
         })
       }
     }
-    this.captureNode = node
+    source.connect(processor)
+    // ScriptProcessor must be connected to destination to run, but keep it silent via a gain node at 0.
+    const gain = ctx.createGain()
+    gain.gain.value = 0
+    processor.connect(gain)
+    gain.connect(ctx.destination)
+    // Keep reference to avoid GC
+    this.scriptProcessor = processor
     this.micOpen = true
   }
 
@@ -507,6 +562,11 @@ export class LiveSession {
     }
     this.session = null
     this.captureNode?.disconnect()
+    try {
+      this.scriptProcessor?.disconnect()
+    } catch {
+      /* ignore */
+    }
     this.micStream?.getTracks().forEach((t) => t.stop())
     void this.audioCtx?.close()
     void this.playbackCtx?.close()
@@ -514,6 +574,7 @@ export class LiveSession {
     this.playbackCtx = null
     this.micStream = null
     this.captureNode = null
+    this.scriptProcessor = null
     this.micOpen = false
     this.callbacks.onStatus('idle')
   }
