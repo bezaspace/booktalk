@@ -244,28 +244,8 @@ export default function App() {
     }
   }, [phase, pttDisabled, sessionActive, onPTTStart, onPTTEnd])
 
-  // Cleanup on unmount.
-  useEffect(() => {
-    return () => {
-      liveRef.current?.close()
-      liveRef.current = null
-    }
-  }, [])
-
-  // ---------------------------------------------------------------------
-  // Render
-  // ---------------------------------------------------------------------
-  if (phase === 'upload') {
-    return (
-      <UploadScreen
-        uploading={uploading}
-        error={error}
-        onFile={handleFile}
-      />
-    )
-  }
-
   // Resizable sidebar divider — drag to adjust width.
+  // Must be before any early return to keep hook order stable.
   const SIDEBAR_MIN = 180
   const SIDEBAR_MAX = 480
   const SIDEBAR_DEFAULT = 280
@@ -291,20 +271,11 @@ export default function App() {
     setSidebarWidth(next)
   }, [])
 
-  const onResizePointerUp = useCallback((e: PointerEvent) => {
+  const onResizePointerUp = useCallback(() => {
     if (!isResizingRef.current) return
     isResizingRef.current = false
     document.body.style.cursor = ''
     document.body.style.userSelect = ''
-    // If released after pointer capture, release explicitly.
-    try {
-      const el = document.querySelector('.sidebar-resizer') as HTMLElement | null
-      if (el && (e.target as HTMLElement)?.hasPointerCapture) {
-        /* no-op, pointer capture auto-released */
-      }
-    } catch {
-      /* ignore */
-    }
   }, [])
 
   useEffect(() => {
@@ -315,6 +286,27 @@ export default function App() {
       window.removeEventListener('pointerup', onResizePointerUp)
     }
   }, [onResizePointerMove, onResizePointerUp])
+
+  // Cleanup on unmount.
+  useEffect(() => {
+    return () => {
+      liveRef.current?.close()
+      liveRef.current = null
+    }
+  }, [])
+
+  // ---------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------
+  if (phase === 'upload') {
+    return (
+      <UploadScreen
+        uploading={uploading}
+        error={error}
+        onFile={handleFile}
+      />
+    )
+  }
 
   // Inline grid template so width is dynamic. Resizer gets a fixed 6px column when open.
   const mainStyle: React.CSSProperties = sidebarCollapsed
