@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from google import genai
 from google.genai import types as gtypes
 from pydantic import BaseModel
@@ -18,9 +22,18 @@ app = FastAPI(title="BookTalk", version="0.1.0")
 
 settings = get_settings()
 
+# ONCE-friendly CORS: if FRONTEND_ORIGIN is set, allow it plus the configured origins.
+# In production the frontend is served from the same origin, so wildcard is fine.
+_cors_origins = settings.cors_origins
+if settings.frontend_origin and settings.frontend_origin not in _cors_origins:
+    _cors_origins = [*_cors_origins, settings.frontend_origin]
+if "*" in _cors_origins:
+    # FastAPI's CORSMiddleware does not allow allow_credentials with wildcard, so use ["*"]
+    _cors_origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=_cors_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -67,7 +80,14 @@ async def health() -> dict:
     return {"ok": True}
 
 
+@app.get("/up")
+async def up() -> dict:
+    """ONCE healthcheck endpoint (also proxies check /health)."""
+    return {"ok": True}
+
+
 @app.post("/upload", response_model=UploadResponse)
+@app.post("/api/upload", response_model=UploadResponse, include_in_schema=False)
 async def upload(file: UploadFile = File(...)) -> UploadResponse:
     """Accept a PDF, hold it in memory keyed by a session id."""
     if not file.filename or not file.filename.lower().endswith(".pdf"):
@@ -86,6 +106,7 @@ async def upload(file: UploadFile = File(...)) -> UploadResponse:
 
 
 @app.get("/page", response_model=PageResponse)
+@app.get("/api/page", response_model=PageResponse, include_in_schema=False)
 async def get_page(
     session: str = Query(..., description="Session id from /upload"),
     page: int = Query(..., ge=1, description="1-based page number"),
@@ -121,6 +142,7 @@ async def get_page(
 
 
 @app.get("/outline", response_model=OutlineResponse)
+@app.get("/api/outline", response_model=OutlineResponse, include_in_schema=False)
 async def get_outline(
     session: str = Query(..., description="Session id from /upload"),
 ) -> OutlineResponse:
@@ -163,6 +185,7 @@ async def get_outline(
 
 
 @app.get("/token", response_model=TokenResponse)
+@app.get("/api/token", response_model=TokenResponse, include_in_schema=False)
 async def get_token() -> TokenResponse:
     """Mint and return a Gemini ephemeral token.
 
@@ -208,3 +231,40 @@ async def get_token() -> TokenResponse:
         model=settings.live_model,
         expires_at=expire_time,
     )
+
+
+# --- Static frontend serving (ONCE / single-container production) ---
+# When the frontend dist directory exists (built by the Dockerfile),
+# serve it from FastAPI so the entire app runs on a single port (80).
+# FRONTEND_DIST can be set to an absolute path; otherwise we look
+# relative to the backend package. Mirrors raksha-voice pattern.
+_FRONTEND_DIST = Path(
+    os.environ.get("FRONTEND_DIST", "")
+    or os.environ.get("BOOKTALK_FRONTEND_DIST", "")
+    or settings.frontend_dist
+    or Path(__file__).resolve().parent.parent / "frontend_dist"
+)
+# Also check /app/frontend_dist as used by the Dockerfile.
+if not _FRONTEND_DIST.is_dir():
+    _alt = Path("/app/frontend_dist")
+    if _alt.is_dir():
+        _FRONTEND_DIST = _alt
+
+if _FRONTEND_DIST.is_dir():
+    # Expose built assets
+    _assets = _FRONTEND_DIST / "assets"
+    if _assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(_assets)), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_spa(full_path: str):  # type: ignore[no-redef]
+        """Serve the React SPA — fall back to index.html for client-side routing."""
+        # Don't shadow API routes — they are matched earlier.
+        if full_path.startswith(("api/", "health", "up", "upload", "page", "outline", "token", "docs", "openapi.json", "redoc")):
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(status_code=404, content={"detail": "Not found"})
+        candidate = _FRONTEND_DIST / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(_FRONTEND_DIST / "index.html")

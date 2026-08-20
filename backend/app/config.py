@@ -19,6 +19,11 @@ class Settings(BaseSettings):
 
     gemini_api_key: str = ""
     allowed_origins: str = "http://localhost:5173"
+    # ONCE/Docker overrides — single-container serves frontend + API on port 80
+    host: str = "0.0.0.0"
+    port: int = 8000
+    frontend_origin: str = "*"
+    frontend_dist: str = ""  # absolute path to built frontend dist, e.g. /app/frontend_dist
     # Live API model — low-latency native audio
     live_model: str = "gemini-3.1-flash-live-preview"
     # How long an ephemeral token may be used to start a new session
