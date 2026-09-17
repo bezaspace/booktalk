@@ -9,6 +9,8 @@ node_modules/
 dist/
 .vite/
 *.local
+# Symlinked frontend deps used by tools/live-debug (see its README)
+tools/live-debug/node_modules
 
 # OS
 .DS_Store
