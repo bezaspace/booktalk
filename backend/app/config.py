@@ -24,8 +24,8 @@ class Settings(BaseSettings):
     port: int = 8000
     frontend_origin: str = "*"
     frontend_dist: str = ""  # absolute path to built frontend dist, e.g. /app/frontend_dist
-    # Live API model — low-latency native audio
-    live_model: str = "gemini-3.1-flash-live-preview"
+    # Live API model — low-latency native audio (default voice agent model)
+    live_model: str = "gemini-3.8-live"
     # How long an ephemeral token may be used to start a new session
     new_session_ttl_seconds: int = 60
     # How long an issued token remains valid for sending messages

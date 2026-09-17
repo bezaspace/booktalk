@@ -26,7 +26,7 @@ The whole thing should feel like reading a book with a knowledgeable friend sitt
 - **Live API**: `@google/genai` (client-side WebSocket, direct to Google)
 - **Audio**: Native Web Audio API (mic capture at 16kHz PCM; playback at 24kHz PCM)
 - **Backend**: FastAPI + PyMuPDF
-- **Model**: `gemini-3.1-flash-live-preview`
+- **Model**: `gemini-3.8-live`
 - **Auth/DB**: None. Ephemeral tokens only — API key stays server-side.
 
 ## Backend (minimal, no DB)

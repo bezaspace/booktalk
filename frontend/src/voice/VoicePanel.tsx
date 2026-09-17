@@ -10,6 +10,8 @@ interface VoicePanelProps {
   sessionActive: boolean
   /** PTT disabled when session not active or otherwise unavailable. */
   pttDisabled: boolean
+  /** Live mic input peak 0..1, sampled while listening. */
+  micLevel: number
   onStartSession: () => void
   onStopSession: () => void
   onRefreshSession: () => void
@@ -42,6 +44,7 @@ export function VoicePanel({
   transcript,
   sessionActive,
   pttDisabled,
+  micLevel,
   onStartSession,
   onStopSession,
   onRefreshSession,
@@ -136,6 +139,34 @@ export function VoicePanel({
             ? 'Hold and speak. Release when done. Pressing again interrupts the assistant.'
             : 'Start the session to enable the microphone.'}
         </div>
+        {listening && (
+          <div
+            className="mic-meter"
+            role="progressbar"
+            aria-label="Microphone input level"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(micLevel * 100)}
+            title="Microphone input level — bars mean your voice is reaching the app"
+            style={{
+              height: 6,
+              borderRadius: 3,
+              background: 'var(--track, rgba(255,255,255,0.12))',
+              marginTop: 8,
+              overflow: 'hidden',
+            }}
+          >
+            <div
+              style={{
+                height: '100%',
+                width: `${Math.round(micLevel * 100)}%`,
+                borderRadius: 3,
+                background: micLevel > 0.02 ? 'var(--dot-listening)' : 'transparent',
+                transition: 'width 90ms linear',
+              }}
+            />
+          </div>
+        )}
       </div>
     </div>
   )

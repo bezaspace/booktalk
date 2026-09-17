@@ -36,6 +36,8 @@ export default function App() {
   const [status, setStatus] = useState<VoiceStatus>('idle')
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([])
   const [sessionActive, setSessionActive] = useState(false)
+  // Mic level 0..1 for the meter, sampled while listening.
+  const [micLevel, setMicLevel] = useState(0)
 
   const liveRef = useRef<LiveSession | null>(null)
   const lastInjectedPageRef = useRef<number>(-1)
@@ -127,6 +129,17 @@ export default function App() {
           setError(msg)
           setStatus('error')
         },
+        onNotice: (msg) => setError(msg),
+        onExhausted: (msg) => {
+          // Reconnects gave up: session already torn down to idle inside.
+          // Drop the ref so one Start press cleanly restarts (page stays).
+          liveRef.current = null
+          setSessionActive(false)
+          setStatus('idle')
+          setError(msg)
+          lastInjectedPageRef.current = -1
+        },
+        refreshToken: fetchToken,
       })
       await session.connect()
       liveRef.current = session
@@ -176,6 +189,15 @@ export default function App() {
           setError(msg)
           setStatus('error')
         },
+        onNotice: (msg) => setError(msg),
+        onExhausted: (msg) => {
+          liveRef.current = null
+          setSessionActive(false)
+          setStatus('idle')
+          setError(msg)
+          lastInjectedPageRef.current = -1
+        },
+        refreshToken: fetchToken,
       })
       await session.connect()
       liveRef.current = session
@@ -220,7 +242,35 @@ export default function App() {
   // PTT is disabled until the session is started (and during reconnects).
   const pttDisabled = !sessionActive || status === 'connecting'
 
-  // Spacebar = push to talk (when not typing in an input and session active).
+  // Mic meter: sample input peak while listening, otherwise show 0.
+  useEffect(() => {
+    if (status !== 'listening') {
+      setMicLevel(0)
+      return
+    }
+    const id = window.setInterval(() => {
+      setMicLevel(liveRef.current?.getMicLevel() ?? 0)
+    }, 100)
+    return () => window.clearInterval(id)
+  }, [status])
+
+  // Safety net: the button's own pointerup can go missing (capture lost,
+  // pointer leaves the window, alert steals focus). A window-level release
+  // ends the burst through the same idempotent path, so the mic can never
+  // stream forever and thinking can never hang on a lost release.
+  useEffect(() => {
+    const end = () => {
+      liveRef.current?.endPushToTalk()
+    }
+    window.addEventListener('pointerup', end)
+    window.addEventListener('pointercancel', end)
+    window.addEventListener('blur', end)
+    return () => {
+      window.removeEventListener('pointerup', end)
+      window.removeEventListener('pointercancel', end)
+      window.removeEventListener('blur', end)
+    }
+  }, [])
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
       if (e.code !== 'Space') return
@@ -356,6 +406,7 @@ export default function App() {
             transcript={transcript}
             sessionActive={sessionActive}
             pttDisabled={pttDisabled}
+            micLevel={micLevel}
             onStartSession={startSession}
             onStopSession={stopSession}
             onRefreshSession={refreshSession}
