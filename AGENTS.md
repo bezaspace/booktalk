@@ -28,6 +28,15 @@ npm run dev
 
 Open http://localhost:5173.
 
+## Debugging the voice session
+
+`DEBUGGING.md` (root) is the reference for the push-to-talk design above: what
+was broken, how it was found, why the current design works, and a runbook for
+when the assistant goes quiet again. The harnesses that produced that evidence
+live in `tools/live-debug/` (protocol probes, a Chrome E2E with a synthetic
+microphone, and a live watcher for a real session). Read it before changing
+`LiveSession.ts`.
+
 ## Verification
 
 - `cd frontend && npx tsc -b` — typecheck
@@ -43,10 +52,33 @@ Open http://localhost:5173.
 
 ## Key behaviors
 
-- Push-to-talk only: mic stream open continuously, PCM forwarded to the Live
-  session only while the button is held; `audioStreamEnd` flushes on release.
-- Page-turn context is injected silently via `sendRealtimeInput` (text for
-  text pages, JPEG video frame for scanned/image pages). The system
-  instruction forbids the model from responding to context updates.
-- Context window compression + session resumption handle long reading
-  sessions (the ~10-min Live connection limit).
+- Push-to-talk only: the mic stream stays open, PCM is forwarded only while
+  the button is held. The button **is** the turn boundary — press sends
+  `activityStart`, release sends `activityEnd`, and automatic VAD is disabled
+  on the session. With automatic VAD the release lands straight off the last
+  word, the turn never commits (the audio is accepted, but no turn completes),
+  and the question is silently swallowed. Measured: 0ms and 800ms of trailing
+  silence still produced nothing; 1500ms worked. Explicit activity is
+  deterministic and is what the app uses.
+- Mic PCM is batched to ~64ms frames in the capture worklet before it reaches
+  the socket (one render quantum would be a WebSocket message every ~2.7ms),
+  and the worklet is flushed on release so the end of the last word survives.
+- Page-turn context is injected silently: text goes through
+  `sendClientContent({ turnComplete: false })`, which appends to the
+  conversation without starting a model turn. Scanned/image pages send a JPEG
+  frame via `sendRealtimeInput({ video })` plus a `clientContent` note — video
+  frames are not "activity" and never trigger a reply on their own. Never use
+  `sendRealtimeInput({ text })` for context: text counts as user activity
+  there, so the model answers the page out loud instead of staying silent.
+- Reconnects are guarded by a per-socket generation counter
+  (`LiveSession.sessionGen`); callbacks from a socket that a newer `connect()`
+  has superseded are ignored. Without it, closing the previous socket during a
+  reconnect re-entered `scheduleReconnect()`, producing an endless
+  Connecting…/Ready flicker and a spurious "connection keeps dropping"
+  teardown. GoAway schedules the resume instead of connecting on top of the
+  still-open socket. Context window compression + session resumption handle
+  long reading sessions (the ~10-min Live connection limit).
+- `thinkingLevel` is not supported by `gemini-3.8-live` (the server refuses the
+  session with close code 1007). Time-to-first-audio is the model's own
+  thinking time, so the UI stays in `thinking` until the first audio frame
+  arrives; a watchdog recovers it if no turn progress arrives at all.

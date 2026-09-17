@@ -3,14 +3,18 @@
  *
  * Responsibilities:
  *  - Connect with an ephemeral token (no API key in the browser).
- *  - Push-to-talk: stream mic PCM (16kHz) only while the button is held;
- *    send `audioStreamEnd` on release.
+ *  - Push-to-talk as an *explicit* turn boundary: the button press sends
+ *    `activityStart` and the release sends `activityEnd`, with automatic VAD
+ *    switched off (see the rationale on `config` in `connect()`).
  *  - Play back model PCM (24kHz) sequentially, with interrupt support.
  *  - Surface live input/output transcripts.
- *  - Inject page context silently: text pages via `sendRealtimeInput({text})`,
- *    scanned/image pages via `sendRealtimeInput({video})` (JPEG frame).
+ *  - Inject page context silently: text goes through
+ *    `sendClientContent({ turnComplete: false })`, which appends to the
+ *    conversation without starting a model turn; scanned/image pages send a
+ *    JPEG frame via `sendRealtimeInput({ video })` (video is not activity).
  *  - Session resumption: capture `sessionResumptionUpdate.newHandle` and
- *    reconnect transparently on GoAway / close.
+ *    reconnect transparently on GoAway / close, ignoring callbacks from
+ *    sockets that a newer connect() has superseded.
  *  - Context window compression for long reading sessions.
  */
 
@@ -53,6 +57,15 @@ export interface LiveSessionCallbacks {
   onTranscript: (entry: TranscriptEntry) => void
   onTranscriptUpdate: (id: string, text: string, partial: boolean) => void
   onError: (message: string) => void
+  /** Recoverable nudge (toast only, session stays usable). */
+  onNotice?: (message: string) => void
+  /** Fatal: reconnects exhausted. The session is already torn down to idle;
+   *  the UI should reset to the pre-start state (not stay "active"). */
+  onExhausted?: (message: string) => void
+  /** Mint a fresh ephemeral token for reconnects. Tokens are single-use
+   *  (uses=1), so resuming after GoAway/close with the original token fails.
+   *  If omitted, reconnects reuse the original token (best-effort). */
+  refreshToken?: () => Promise<{ token: string; model: string }>
 }
 
 /** Mic-capture AudioWorklet processor source, inlined as a string.
@@ -64,25 +77,37 @@ class CaptureProcessor extends AudioWorkletProcessor {
     this.targetRate = options.processorOptions?.targetRate || 16000
     this.ratio = Math.round(sampleRate / this.targetRate)
     if (this.ratio < 1) this.ratio = 1
-    this.buffer = []
+    // Batch to ~64ms frames. One render quantum is only ~2.7ms at 16kHz, which
+    // would put a WebSocket message on the wire roughly 375 times a second;
+    // the Live API expects 20-100ms audio chunks.
+    this.batchSamples = Math.max(1, Math.round(this.targetRate * 0.064))
+    this.out = new Int16Array(this.batchSamples)
+    this.outLen = 0
+    // Push-to-talk release asks for whatever is still buffered, so the tail of
+    // the last word is not left sitting in the worklet.
+    this.port.onmessage = (ev) => {
+      if (ev.data && ev.data.cmd === 'flush') this.flush()
+    }
+  }
+  flush() {
+    if (this.outLen === 0) return
+    const chunk = this.out.slice(0, this.outLen)
+    this.outLen = 0
+    // Transfer the underlying buffer for zero-copy.
+    this.port.postMessage(chunk.buffer, [chunk.buffer])
   }
   process(inputs) {
     const input = inputs[0]
     const channel = input && input[0]
     if (!channel || channel.length === 0) return true
     // Average each block of ratio samples to downsample (simple low-pass).
-    const out = new Int16Array(Math.floor(channel.length / this.ratio))
-    let oi = 0
     for (let i = 0; i + this.ratio <= channel.length; i += this.ratio) {
       let sum = 0
       for (let j = 0; j < this.ratio; j++) sum += channel[i + j]
       const avg = sum / this.ratio
-      let s = Math.max(-1, Math.min(1, avg))
-      out[oi++] = s < 0 ? s * 0x8000 : s * 0x7fff
-    }
-    if (oi > 0) {
-      // Transfer the underlying buffer for zero-copy.
-      this.port.postMessage(out.buffer, [out.buffer])
+      const s = Math.max(-1, Math.min(1, avg))
+      this.out[this.outLen++] = s < 0 ? s * 0x8000 : s * 0x7fff
+      if (this.outLen === this.batchSamples) this.flush()
     }
     return true
   }
@@ -131,6 +156,26 @@ export class LiveSession {
   private scriptProcessor: ScriptProcessorNode | null = null
   private micOpen = false
   private pttHeld = false
+  private micAnalyser: AnalyserNode | null = null
+  // Push-to-talk bookkeeping. A burst is an explicit activity in the session:
+  // press => activityStart, release => activityEnd. `activityOpen` tracks an
+  // activityStart that has not been closed yet; `pttAudioChunks` counts the
+  // chunks forwarded during it, so a press that produced no audio closes the
+  // activity without leaving the UI waiting on a turn that cannot arrive.
+  private activityOpen = false
+  private pttAudioChunks = 0
+  private thinkingTimer: ReturnType<typeof setTimeout> | null = null
+  // With an explicit turn boundary the server always has a complete turn, so
+  // this watchdog is only a net for a genuinely dead socket.
+  private static readonly THINKING_WATCHDOG_MS = 45000
+  // Every live.connect() gets a generation number. Callbacks from a socket a
+  // later connect() has superseded are ignored; otherwise the old socket's
+  // onclose schedules another reconnect (connect -> close old -> onclose ->
+  // reconnect -> ...), which is what produced the "Connecting…/Ready" flicker
+  // and the spurious "connection keeps dropping" teardown.
+  private sessionGen = 0
+  private goAwayTimer: ReturnType<typeof setTimeout> | null = null
+  private static readonly GOAWAY_RESUME_MS = 1500
 
   // Playback
   private playbackCtx: AudioContext | null = null
@@ -161,10 +206,24 @@ export class LiveSession {
   async connect(): Promise<void> {
     this.intentionallyClosed = false
     this.callbacks.onStatus('connecting')
-    console.debug('[Live] connect() start', { hasResumptionHandle: !!this.resumptionHandle })
+    console.debug('[Live] connect() start', { hasResumptionHandle: !!this.resumptionHandle, model: this.model })
 
     await this.ensureMic()
     await this.ensurePlayback()
+
+    // Ephemeral tokens are single-use: mint a fresh one for every reconnect
+    // that carries a resumption handle. The initial connect uses the token
+    // passed to the constructor.
+    if (this.resumptionHandle && this.callbacks.refreshToken) {
+      try {
+        const fresh = await this.callbacks.refreshToken()
+        this.model = fresh.model
+        this.client = new GoogleGenAI({ apiKey: fresh.token, httpOptions: { apiVersion: 'v1alpha' } })
+        console.debug('[Live] refreshed ephemeral token for resume', { model: this.model })
+      } catch (e) {
+        console.error('[Live] token refresh failed, reusing original token', e)
+      }
+    }
 
     const config = {
       responseModalities: [Modality.AUDIO],
@@ -177,25 +236,103 @@ export class LiveSession {
       sessionResumption: this.resumptionHandle ? { handle: this.resumptionHandle } : undefined,
       // Include audio activity + all video since last turn, so scanned-page
       // frames sent during page turns are visible when the user asks.
-      realtimeInputConfig: { turnCoverage: TurnCoverage.TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO },
+      realtimeInputConfig: {
+        turnCoverage: TurnCoverage.TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO,
+        // Push-to-talk, not an open mic: the button IS the turn boundary.
+        //
+        // With automatic VAD the server decides when the user's turn ended,
+        // and it needs trailing silence to commit end-of-speech. Releasing the
+        // button straight off the last word therefore left the turn open: the
+        // audio was accepted (it even interrupted the model) but no turn ever
+        // completed, so no transcript and no answer arrived and the UI sat in
+        // "Thinking…" until a timeout. Measured against the live API: 0ms and
+        // 800ms of trailing silence still produced nothing, 1500ms worked.
+        // Disabling VAD and sending activityStart/activityEnd on the button
+        // makes the boundary explicit and deterministic.
+        automaticActivityDetection: { disabled: true },
+      },
     }
+
+    // This connect supersedes anything before it; older sockets go inert.
+    const gen = ++this.sessionGen
+    const isCurrent = () => gen === this.sessionGen
+
+    // Drop any dead socket before opening a new one (reconnect path).
+    if (this.session) {
+      try {
+        this.session.close()
+      } catch {
+        /* already dead */
+      }
+      this.session = null
+    }
+    this.lastCloseReason = 'clean open'
 
     this.session = await this.client.live.connect({
       model: this.model,
       config,
       callbacks: {
         onopen: () => {
-          console.debug('[Live] WebSocket onopen')
+          if (!isCurrent()) return
+          console.debug('[Live] WebSocket onopen', { gen, resumed: !!this.resumptionHandle })
+          this.openedAt = Date.now()
+          this.reconnectAttempts = 0
+          // A connection that survives 15s counts as healthy — reset the
+          // early-close counter so one-off blips don't accumulate forever.
+          if (this.steadyTimer) clearTimeout(this.steadyTimer)
+          this.steadyTimer = setTimeout(() => {
+            if (isCurrent() && !this.intentionallyClosed) {
+              this.earlyCloses = 0
+              console.debug('[Live] connection steady for 15s, reset early-close counter')
+            }
+          }, LiveSession.STEADY_AFTER_MS)
           this.callbacks.onStatus(this.pttHeld ? 'listening' : 'connected')
         },
-        onmessage: (msg: LiveServerMessage) => this.handleMessage(msg),
+        onmessage: (msg: LiveServerMessage) => {
+          if (!isCurrent()) return
+          this.handleMessage(msg)
+        },
         onerror: (e: ErrorEvent) => {
+          if (!isCurrent()) return
           console.error('[Live] WebSocket onerror', e.message)
+          this.lastCloseReason = e.message || 'websocket error'
           this.callbacks.onError(`Live error: ${e.message}`)
         },
-        onclose: () => {
-          console.warn('[Live] WebSocket onclose. intentionallyClosed=' + this.intentionallyClosed + ' speaking=' + this.speaking + ' queueLen=' + this.playbackQueue.length)
+        onclose: (e?: CloseEvent) => {
+          if (!isCurrent()) {
+            console.debug('[Live] ignoring close from superseded socket', { gen, current: this.sessionGen })
+            return
+          }
+          const code = (e as CloseEvent | undefined)?.code
+          const reason = (e as CloseEvent | undefined)?.reason
+          const openMs = this.openedAt ? Date.now() - this.openedAt : -1
+          console.warn('[Live] WebSocket onclose. code=' + code + ' reason=' + reason + ' openMs=' + openMs + ' intentionallyClosed=' + this.intentionallyClosed)
+          if (this.steadyTimer) {
+            clearTimeout(this.steadyTimer)
+            this.steadyTimer = null
+          }
           if (this.intentionallyClosed) return
+          this.lastCloseReason = reason || (typeof code === 'number' ? `close code ${code}` : 'unexpected close')
+          // Opened fine but died young, repeatedly → the server (or the
+          // network) is rejecting the live session itself. Stop looping and
+          // say so; the toast shows the close code/reason.
+          if (openMs >= 0 && openMs < LiveSession.STEADY_AFTER_MS) {
+            this.earlyCloses += 1
+          }
+          if (this.earlyCloses > LiveSession.MAX_EARLY_CLOSES) {
+            console.error('[Live] connection died young ' + this.earlyCloses + 'x in a row. last=' + this.lastCloseReason)
+            const msg =
+              `Voice connection keeps dropping (${this.earlyCloses}x, last: ${this.lastCloseReason}). Check network/VPN, then press Start.`
+            this.earlyCloses = 0
+            this.resumptionHandle = null
+            // Tear down to idle first so one Start press cleanly restarts;
+            // then report. Without this the UI stays "active" with a dead
+            // session and PTT half-enabled.
+            this.close()
+            if (this.callbacks.onExhausted) this.callbacks.onExhausted(msg)
+            else this.callbacks.onError(msg)
+            return
+          }
           // Unexpected close — try to resume if we have a handle.
           this.callbacks.onStatus('connecting')
           this.scheduleReconnect()
@@ -205,10 +342,44 @@ export class LiveSession {
   }
 
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private reconnectAttempts = 0
+  private earlyCloses = 0
+  private openedAt = 0
+  private steadyTimer: ReturnType<typeof setTimeout> | null = null
+  private lastCloseReason = 'unknown'
+  private static readonly MAX_RESUME_ATTEMPTS = 2
+  private static readonly MAX_RECONNECT_ATTEMPTS = 5
+  private static readonly MAX_EARLY_CLOSES = 4
+  private static readonly STEADY_AFTER_MS = 15000
+
   private scheduleReconnect(): void {
     if (this.intentionallyClosed) return
     if (this.reconnectTimer) return
-    console.warn('[Live] scheduling reconnect in 800ms. hasHandle=' + !!this.resumptionHandle)
+    this.reconnectAttempts += 1
+    if (this.reconnectAttempts > LiveSession.MAX_RECONNECT_ATTEMPTS) {
+      console.error('[Live] giving up after ' + LiveSession.MAX_RECONNECT_ATTEMPTS + ' reconnects. lastClose=' + this.lastCloseReason)
+      const msg =
+        `Voice connection keeps dropping (${LiveSession.MAX_RECONNECT_ATTEMPTS} retries, last: ${this.lastCloseReason}). Press Start for a fresh session.`
+      this.reconnectAttempts = 0
+      // Drop the possibly-stale resumption handle so the next manual Start
+      // begins clean instead of replaying a handle the server rejects.
+      this.resumptionHandle = null
+      this.close()
+      if (this.callbacks.onExhausted) this.callbacks.onExhausted(msg)
+      else this.callbacks.onError(msg)
+      return
+    }
+    // After a couple of failed resume attempts the handle itself is likely
+    // stale (server rejected it) — retry fresh without it rather than
+    // looping on the same rejected handle forever.
+    if (this.reconnectAttempts > LiveSession.MAX_RESUME_ATTEMPTS && this.resumptionHandle) {
+      console.warn('[Live] dropping stale resumption handle, will reconnect fresh')
+      this.resumptionHandle = null
+    }
+    const backoffMs = Math.min(800 * 2 ** (this.reconnectAttempts - 1), 10000)
+    // ±25% jitter so reconnect storms don't beat in lockstep with the LB.
+    const jitteredMs = Math.round(backoffMs * (0.75 + Math.random() * 0.5))
+    console.warn('[Live] scheduling reconnect in ' + jitteredMs + 'ms. attempt=' + this.reconnectAttempts + ' hasHandle=' + !!this.resumptionHandle)
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       if (this.intentionallyClosed) return
@@ -217,7 +388,7 @@ export class LiveSession {
         this.callbacks.onError(`Reconnect failed: ${err?.message ?? err}`)
         this.scheduleReconnect()
       })
-    }, 800)
+    }, jitteredMs)
   }
 
   /** Idempotent: open mic + capture worklet once. */
@@ -246,6 +417,14 @@ export class LiveSession {
       },
     })
     const source = ctx.createMediaStreamSource(this.micStream)
+    // Level tap for the mic meter (no output connection — stays silent).
+    try {
+      this.micAnalyser = ctx.createAnalyser()
+      this.micAnalyser.fftSize = 512
+      source.connect(this.micAnalyser)
+    } catch {
+      this.micAnalyser = null
+    }
 
     if (hasWorklet) {
       try {
@@ -266,6 +445,7 @@ export class LiveSession {
             this.session.sendRealtimeInput({
               audio: { data: b64, mimeType: 'audio/pcm;rate=16000' },
             })
+            this.pttAudioChunks += 1
           }
         }
         this.captureNode = node as unknown as AudioWorkletNode
@@ -298,6 +478,7 @@ export class LiveSession {
         this.session!.sendRealtimeInput({
           audio: { data: b64, mimeType: 'audio/pcm;rate=16000' },
         })
+        this.pttAudioChunks += 1
       }
     }
     source.connect(processor)
@@ -319,12 +500,16 @@ export class LiveSession {
   // -----------------------------------------------------------------------
   // Push to talk
   // -----------------------------------------------------------------------
-  /** Begin a push-to-talk burst: forward mic audio until release(). */
+  /** Begin a push-to-talk burst: open an explicit activity and stream audio. */
   startPushToTalk(): void {
     if (!this.session) return
+    if (this.pttHeld) return // re-entrant pointerdown — already in a burst
     this.pttHeld = true
-    console.debug('[Live] PTT start — interrupting playback. speaking=' + this.speaking + ' queueLen=' + this.playbackQueue.length)
-    // Interrupt any in-flight playback.
+    this.pttAudioChunks = 0
+    this.disarmThinkingWatchdog()
+    console.debug('[Live] PTT start — activityStart. speaking=' + this.speaking + ' queueLen=' + this.playbackQueue.length)
+    // Pressing the button is also how the user barges in: stop local playback
+    // now, and let the activityStart below cancel the server's generation.
     this.stopPlayback()
     // Finalize any pending assistant transcript from a prior turn.
     if (this.currentAssistantEntryId) {
@@ -332,21 +517,114 @@ export class LiveSession {
       this.currentAssistantEntryId = null
       this.currentAssistantText = ''
     }
+    // Open the turn: everything sent until activityEnd is part of this
+    // question, and the server needs no silence to decide where it ended.
+    this.session.sendRealtimeInput({ activityStart: {} })
+    this.activityOpen = true
     this.callbacks.onStatus('listening')
     // Resume audio contexts (browsers suspend until a user gesture).
     void this.audioCtx?.resume()
     void this.playbackCtx?.resume()
   }
 
-  /** End a push-to-talk burst: flush the audio stream. */
-  endPushToTalk(): void {
-    this.pttHeld = false
-    console.debug('[Live] PTT end — flushing audioStreamEnd')
-    if (this.session) {
-      // Flush cached audio so the server processes the turn promptly.
-      this.session.sendRealtimeInput({ audioStreamEnd: true })
+  /** Current mic input peak 0..1 (for the level meter). 0 when mic closed. */
+  getMicLevel(): number {
+    if (!this.micOpen || !this.micAnalyser) return 0
+    try {
+      const buf = new Uint8Array(this.micAnalyser.fftSize)
+      this.micAnalyser.getByteTimeDomainData(buf)
+      let peak = 0
+      for (let i = 0; i < buf.length; i++) {
+        const v = Math.abs(buf[i]! - 128) / 128
+        if (v > peak) peak = v
+      }
+      return Math.min(1, peak)
+    } catch {
+      return 0
     }
+  }
+
+  /** Whether a burst is currently held (for window-level release fallback). */
+  isHolding(): boolean {
+    return this.pttHeld
+  }
+
+  /** End a push-to-talk burst: close the activity, which ends the turn. */
+  endPushToTalk(): void {
+    // Idempotent: pointerup + pointercancel/pointerleave can all fire for one
+    // press. Only the first release ends the burst.
+    if (!this.pttHeld) return
+    this.pttHeld = false
+
+    const hadAudio = this.pttAudioChunks > 0
+    const session = this.session
+
+    if (!this.activityOpen) {
+      // Never opened (released before the first chunk, or the session died
+      // mid-press) — there is no turn to close.
+      if (!this.speaking) this.callbacks.onStatus('connected')
+      return
+    }
+    this.activityOpen = false
+
+    if (session) {
+      // Hand over the tail of a partially filled audio batch, then close the
+      // turn. The 30ms gap is well below the threshold of perception and lets
+      // that last batch reach the socket before the activity ends.
+      try {
+        this.captureNode?.port.postMessage({ cmd: 'flush' })
+      } catch {
+        /* worklet already gone */
+      }
+      const closeActivity = () => {
+        if (this.intentionallyClosed) return
+        try {
+          session.sendRealtimeInput({ activityEnd: {} })
+        } catch (e) {
+          console.warn('[Live] activityEnd failed', e)
+        }
+      }
+      if (hadAudio) setTimeout(closeActivity, 30)
+      else closeActivity()
+    }
+
+    if (!hadAudio) {
+      // A tap, or a press with nothing captured: the activity is closed, but no
+      // answer can be on its way, so do not pretend to be thinking.
+      console.debug('[Live] PTT end with no audio — activity closed without a turn')
+      if (!this.speaking) this.callbacks.onStatus('connected')
+      return
+    }
+
+    console.debug('[Live] PTT end — activityEnd. chunks=' + this.pttAudioChunks)
     this.callbacks.onStatus('thinking')
+    this.armThinkingWatchdog()
+  }
+
+  private armThinkingWatchdog(): void {
+    this.disarmThinkingWatchdog()
+    this.thinkingTimer = setTimeout(() => {
+      this.thinkingTimer = null
+      // A complete turn was sent and nothing came back. Recover to Ready
+      // instead of sitting in "Thinking…" forever.
+      console.warn('[Live] thinking watchdog fired — no turn progress for ' + LiveSession.THINKING_WATCHDOG_MS + 'ms')
+      this.callbacks.onStatus('connected')
+      if (this.callbacks.onNotice) {
+        this.callbacks.onNotice("Didn't get a response for that one — hold the button and ask again.")
+      }
+    }, LiveSession.THINKING_WATCHDOG_MS)
+  }
+
+  /** Extend the watchdog: the turn is alive but has not produced audio yet. */
+  private extendThinkingWatchdog(): void {
+    if (this.thinkingTimer) this.armThinkingWatchdog()
+  }
+
+  private disarmThinkingWatchdog(): void {
+    if (this.thinkingTimer) {
+      clearTimeout(this.thinkingTimer)
+      this.thinkingTimer = null
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -356,20 +634,39 @@ export class LiveSession {
   injectTextPage(page: number, pageCount: number, text: string): void {
     if (!this.session) return
     const payload =
-      `[CONTEXT — page ${page} of ${pageCount}. Do NOT respond to this; it is the current page the user is reading.]\n\n${text}`
-    this.session.sendRealtimeInput({ text: payload })
+      `[CONTEXT — page ${page} of ${pageCount}. This is the page the user is currently reading. Do NOT respond to this.]\n\n${text}`
+    // turnComplete:false appends the page to the conversation without starting
+    // a model turn, so the model can see the page but stays silent. Sending the
+    // same text as realtime input does not work: there, text counts as user
+    // activity, and the model starts answering the page out loud.
+    this.session.sendClientContent({
+      turns: [{ role: 'user', parts: [{ text: payload }] }],
+      turnComplete: false,
+    })
   }
 
   /** Inject a scanned/image page as a JPEG frame. */
   injectImagePage(jpegBytes: Uint8Array, page: number, pageCount: number): void {
     if (!this.session) return
-    // A short text tag accompanies the frame so the model knows it's context,
-    // not a question. The system instruction reinforces silence.
+    // A frame is not activity (only voice and text are), so this never triggers
+    // a reply by itself. The accompanying note must still go through
+    // clientContent — as realtime text it would make the model describe the
+    // page unprompted.
     this.session.sendRealtimeInput({
       video: { data: uint8ToBase64(jpegBytes), mimeType: 'image/jpeg' },
     })
-    this.session.sendRealtimeInput({
-      text: `[CONTEXT — image of page ${page} of ${pageCount}. Do NOT respond to this; it is the current page the user is reading.]`,
+    this.session.sendClientContent({
+      turns: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: `[CONTEXT — image of page ${page} of ${pageCount}. This is the page the user is currently reading. Do NOT respond to this.]`,
+            },
+          ],
+        },
+      ],
+      turnComplete: false,
     })
   }
 
@@ -388,20 +685,30 @@ export class LiveSession {
       }
     }
 
-    // GoAway — server will disconnect soon; reconnect proactively.
+    // GoAway — the server is about to drop this connection. Resume on a fresh
+    // socket shortly before that happens instead of reconnecting on top of a
+    // still-open one (the resumption handle keeps it the same reading session).
     if (msg.goAway) {
-      console.warn('[Live] GoAway received — scheduling reconnect. speaking=' + this.speaking + ' queueLen=' + this.playbackQueue.length)
-      this.scheduleReconnect()
+      console.warn('[Live] GoAway received — will resume on a new connection. speaking=' + this.speaking)
+      if (!this.goAwayTimer) {
+        this.goAwayTimer = setTimeout(() => {
+          this.goAwayTimer = null
+          if (!this.intentionallyClosed) this.scheduleReconnect()
+        }, LiveSession.GOAWAY_RESUME_MS)
+      }
       return
     }
 
     if (!content) {
-      console.debug('[Live] message with no serverContent', Object.keys(msg))
+      // Keep-alive / metadata-only frames: {}, setupComplete, usageMetadata.
       return
     }
 
-    // Transcripts — fragments arrive incrementally; accumulate and emit full text.
+    // Any transcript means the turn was accepted, but not that an answer is on
+    // its way — a thorough answer can think for a while before its first audio
+    // frame, so this only extends the watchdog.
     if (content.inputTranscription?.text) {
+      this.extendThinkingWatchdog()
       if (!this.currentUserEntryId) {
         this.currentUserEntryId = nextEntryId('user')
         this.currentUserText = content.inputTranscription.text
@@ -417,6 +724,7 @@ export class LiveSession {
       }
     }
     if (content.outputTranscription?.text) {
+      this.extendThinkingWatchdog()
       if (!this.currentAssistantEntryId) {
         this.currentAssistantEntryId = nextEntryId('assistant')
         this.currentAssistantText = content.outputTranscription.text
@@ -436,6 +744,7 @@ export class LiveSession {
     // assistant transcript so the next response starts a fresh entry.
     if (content.interrupted) {
       console.warn('[Live] INTERRUPTED — stopping playback. pttHeld=' + this.pttHeld + ' queueLen=' + this.playbackQueue.length + ' speaking=' + this.speaking)
+      this.disarmThinkingWatchdog()
       this.stopPlayback()
       if (this.currentAssistantEntryId) {
         this.callbacks.onTranscriptUpdate(this.currentAssistantEntryId, this.currentAssistantText, false)
@@ -446,7 +755,8 @@ export class LiveSession {
       return
     }
 
-    // Audio parts — enqueue for playback.
+    // Audio parts — enqueue for playback. The first audio of a turn means the
+    // answer has started, so the wait-for-a-response watchdog is done.
     if (content.modelTurn?.parts) {
       const parts = content.modelTurn.parts
       let audioCount = 0
@@ -456,14 +766,15 @@ export class LiveSession {
           audioCount++
         }
       }
-      if (audioCount > 0) {
-        console.debug('[Live] audio chunks received', { count: audioCount, queueLen: this.playbackQueue.length, speaking: this.speaking })
-      }
+      if (audioCount > 0) this.disarmThinkingWatchdog()
     }
 
     // Turn complete — finalize transcript entries (mark non-partial).
     if (content.turnComplete) {
-      console.debug('[Live] turnComplete. speaking=' + this.speaking + ' queueLen=' + this.playbackQueue.length + ' pttHeld=' + this.pttHeld)
+      this.disarmThinkingWatchdog()
+      if (content.turnCompleteReason && content.turnCompleteReason !== 'TURN_COMPLETE_REASON_UNSPECIFIED') {
+        console.warn('[Live] turnComplete reason=' + content.turnCompleteReason)
+      }
       if (this.currentUserEntryId) {
         this.callbacks.onTranscriptUpdate(this.currentUserEntryId, this.currentUserText, false)
         this.currentUserEntryId = null
@@ -474,8 +785,14 @@ export class LiveSession {
         this.currentAssistantEntryId = null
         this.currentAssistantText = ''
       }
-      if (!this.pttHeld && !this.speaking) {
+      // A turn that ends without an answer (the model decided it had nothing
+      // to say, or it was waiting for more input) must not leave the UI
+      // claiming to think.
+      if (!this.speaking && !this.pttHeld) {
         this.callbacks.onStatus('connected')
+        if (this.pttAudioChunks > 0 && !this.currentAssistantText && content.waitingForInput) {
+          this.callbacks.onNotice?.("I didn't catch that — try holding the button and speaking again.")
+        }
       }
     }
   }
@@ -487,6 +804,13 @@ export class LiveSession {
     const ctx = this.playbackCtx
     if (!ctx) return
     const pcm = this.base64ToInt16(base64)
+    // The model occasionally emits empty/tiny keep-alive chunks. Scheduling
+    // a ~0-length buffer flickers playback state (START then instant ENDED,
+    // Speaking → Ready). Drop anything under 20ms.
+    if (pcm.length < Math.floor(OUTPUT_SAMPLE_RATE * 0.02)) {
+      console.debug('[Live] skipping tiny audio chunk', { samples: pcm.length })
+      return
+    }
     const float = new Float32Array(pcm.length)
     for (let i = 0; i < pcm.length; i++) {
       float[i] = pcm[i] / 0x8000
@@ -550,10 +874,24 @@ export class LiveSession {
   // -----------------------------------------------------------------------
   close(): void {
     this.intentionallyClosed = true
+    // Invalidate any callback still in flight from the socket we are closing.
+    this.sessionGen += 1
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
+    if (this.goAwayTimer) {
+      clearTimeout(this.goAwayTimer)
+      this.goAwayTimer = null
+    }
+    if (this.steadyTimer) {
+      clearTimeout(this.steadyTimer)
+      this.steadyTimer = null
+    }
+    this.disarmThinkingWatchdog()
+    this.activityOpen = false
+    this.earlyCloses = 0
+    this.openedAt = 0
     this.stopPlayback()
     try {
       this.session?.close()
@@ -568,6 +906,7 @@ export class LiveSession {
       /* ignore */
     }
     this.micStream?.getTracks().forEach((t) => t.stop())
+    this.micAnalyser = null
     void this.audioCtx?.close()
     void this.playbackCtx?.close()
     this.audioCtx = null
