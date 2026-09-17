@@ -28,6 +28,40 @@ npm run dev
 
 Open http://localhost:5173.
 
+## Deploy (once, single container)
+
+The desktop entry `BookTalk.desktop` opens `http://booktalk.local`, served by the
+`once` platform (Docker + kamal-proxy). To update a deployed app:
+
+```bash
+# 1. build from the root Dockerfile (frontend + backend in one image)
+docker build -t localhost:5000/booktalk:latest -t booktalk:latest .
+# 2. publish it (tag as 127.0.0.1, see note 2)
+docker tag localhost:5000/booktalk:latest 127.0.0.1:5000/booktalk:latest
+docker push 127.0.0.1:5000/booktalk:latest
+# 3. roll the app onto the new image, keeping its host/TLS/env
+once update booktalk.local --image 127.0.0.1:5000/booktalk:latest --disable-tls \
+  --env GEMINI_API_KEY=<from the running container>   # see note 4
+```
+
+1. Use `once update <host>`, **not** `once deploy` — deploy creates a *new* app
+   instance and fails with `Error: hostname already in use`.
+2. Push/pull via **`127.0.0.1:5000`**, not `localhost:5000`. The daemon's
+   `insecure-registries` cover `127.0.0.0/8` and `::1`, so `localhost` is dialled
+   over HTTPS against an HTTP-only registry and fails with a confusing
+   `connection refused`.
+3. The `registry` container must be running (`docker start registry`). It can
+   exit and once does not restart it — while it is down, **every** pull/update
+   fails, for all apps.
+4. An app's env and secret keys live in the running container's `once` label:
+   `docker inspect <container> -f '{{index .Config.Labels "once"}}'`. Read
+   `GEMINI_API_KEY` from there and pass it to `once update`, or the redeploy
+   loses the API key. That label exposes the key in plaintext, so treat the
+   output accordingly.
+5. Verify a deploy by the served bundle, not by the CLI's success message:
+   `curl --resolve booktalk.local:80:127.0.0.1 http://booktalk.local/` and check
+   the asset hash / grep the JS for a marker from the change.
+
 ## Debugging the voice session
 
 `DEBUGGING.md` (root) is the reference for the push-to-talk design above: what
